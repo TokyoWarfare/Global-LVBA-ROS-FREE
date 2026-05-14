@@ -1414,7 +1414,12 @@ void LvbaSystem::optimizeCameraPoses()
     options.minimizer_progress_to_stdout = true;
 
     for (int k = 0; k < M; ++k) {
-        problem.AddParameterBlock(qs[k].data(), 4, new ceres::EigenQuaternionManifold());
+        // Ceres API: `EigenQuaternionManifold` is 2.2+. Ubuntu 22.04 ships
+        // Ceres 2.0, where the equivalent is `EigenQuaternionParameterization`
+        // passed via `SetParameterization(...)` instead of bound at
+        // `AddParameterBlock(...)`. Behaviour is identical for our purposes.
+        problem.AddParameterBlock(qs[k].data(), 4);
+        problem.SetParameterization(qs[k].data(), new ceres::EigenQuaternionParameterization());
         problem.AddParameterBlock(ts[k].data(), 3);
     }
     problem.SetParameterBlockConstant(qs[0].data());

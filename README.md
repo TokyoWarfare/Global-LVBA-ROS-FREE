@@ -22,14 +22,50 @@ If you want to push accuracy to the next level, Global-LVBA further optimizes:
 - Eigen 3.3.7
 - OpenCV 4.2.0
 
-## 2. Build
+## 2. Build (this fork — Docker, no ROS)
+
+This fork is a ROS-stripped variant of Global-LVBA. Source code includes a small
+`ros_shim.h` that replaces the few ROS APIs the original used (NodeHandle::param,
+Publisher::publish, sensor_msgs::PointCloud2), so no ROS distribution is needed
+to build or run. A YAML file replaces `rosparam load`.
+
+The build environment is pinned in a `Dockerfile` at the repo root (Ubuntu 22.04
++ CUDA 12.2 + LVBA's prereqs + a sed-patched legacy Sophus). Source is mounted
+from the host so editing/git/iteration stays normal.
+
+### One-time setup
 
 ```bash
-cd catkin_ws/src/Global-LVBA
-git submodule update --init --recursive
-cd SiftGPU && mkdir build && cd build && cmake .. && make
-cd catkin_ws && catkin_make
+git clone <this-repo-url> ~/lvba_ws/Global-LVBA
+cd ~/lvba_ws/Global-LVBA
+git submodule update --init --recursive    # pulls SiftGPU
+docker build -t lvba:dev .                  # builds the image (~10-20 min first time)
 ```
+
+### Build LVBA itself (inside the container, source mounted from host)
+
+```bash
+docker run --gpus all --rm -it \
+    -v ~/lvba_ws/Global-LVBA:/opt/lvba \
+    -v /data:/data \
+    lvba:dev
+
+# now inside the container:
+cd /opt/lvba/src/SiftGPU && mkdir -p build && cd build && cmake .. && make -j
+cd /opt/lvba && mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make -j
+```
+
+The binary lands at `/opt/lvba/build/lvba_run` (same path on the host since
+the source is mounted).
+
+### Run
+
+```bash
+# inside the container:
+./build/lvba_run /data/lvba_dataset/CBD_Building_01/config.yaml
+```
+
+Replace the config path with whatever dataset you're pointing at.
 ## 3. Dataset preparation 
     Global-LVBA/
     └── dataset/

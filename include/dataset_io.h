@@ -2,7 +2,7 @@
 #define DATASET_IO_H
 
 #include <string>
-#include <ros/ros.h>
+#include "ros_shim.h"
 #include <regex>
 #include <filesystem>
 #include <pcl/io/pcd_io.h>

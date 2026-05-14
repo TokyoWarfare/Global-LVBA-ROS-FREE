@@ -567,7 +567,7 @@ public:
     OCTO_TREE_ROOT(int _winsize, float _eigen_thr) : OCTO_TREE_NODE(_winsize, _eigen_thr) {}
 };
 
-bool iter_stop(Eigen::VectorXd &dx, double thre = 1e-7, int win_size = 0)
+inline bool iter_stop(Eigen::VectorXd &dx, double thre = 1e-7, int win_size = 0)
 {
   // int win_size = dx.rows() / 6;
   if(win_size == 0)
@@ -796,7 +796,7 @@ public:
 };
 
 
-void cut_voxel(unordered_map<VOXEL_LOC, OCTO_TREE_ROOT*> &feat_map, pcl::PointCloud<PointType> &pl_feat,
+inline void cut_voxel(unordered_map<VOXEL_LOC, OCTO_TREE_ROOT*> &feat_map, pcl::PointCloud<PointType> &pl_feat,
                const IMUST &x_key, int fnum, int win_size,
                double voxel_size = 1.0, float eigen_ratio = 0.1)
 {

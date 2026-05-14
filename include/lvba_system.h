@@ -1,14 +1,12 @@
 #ifndef LVBA_SYSTEM_H
 #define LVBA_SYSTEM_H
 
-#include <ros/ros.h>
+#include "ros_shim.h"
 #include <thread>
 #include <pcl/common/common.h>
 #include <GL/glew.h>   // 先
 #include <GL/gl.h>     // 后
 #include <pcl/filters/voxel_grid.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <pcl_conversions/pcl_conversions.h>
 #include "dataset_io.h"
 #include "sophus/se3.h"
 #include "SiftGPU.h"

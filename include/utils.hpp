@@ -5,7 +5,9 @@
 #include <iostream>
 #include <opencv2/opencv.hpp>
 #include <unordered_map>
-#include <pcl/visualization/pcl_visualizer.h>
+// pcl/visualization removed -- not used anywhere in this header and pulls
+// in the full VTK toolchain unnecessarily. Re-add only if a visualizer is
+// actually needed.
 #include <opencv2/features2d.hpp>
 #include <algorithm>
 #include <ceres/ceres.h>
@@ -222,7 +224,7 @@ inline double computeMAD(const std::vector<double>& resid) {
 }
 
 // 仅修改此函数：按你提出的4条规则筛 inliers；否则 inliers 留空
-void pickLargestClusterAsInliers(
+inline void pickLargestClusterAsInliers(
     const std::vector<Eigen::Vector3d>& points3d,
     const std::vector<int>& idx_valid,
     std::vector<int>& inliers)
@@ -417,7 +419,7 @@ static inline std::string fmtTs(double ts, int precision = 6) {
     return oss.str();
 }
 
-void printProgressBar(size_t current, size_t total, size_t barWidth = 50) {
+inline void printProgressBar(size_t current, size_t total, size_t barWidth = 50) {
     if (total == 0) return;
     double progress = static_cast<double>(current) / static_cast<double>(total);
     size_t pos = static_cast<size_t>(barWidth * progress);

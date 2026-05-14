@@ -22,9 +22,9 @@
 typedef pcl::PointXYZINormal PointType;
 using namespace std;
 
-Eigen::Matrix3d I33(Eigen::Matrix3d::Identity());
-Eigen::Matrix<double, DIMU, DIMU> I_imu(Eigen::Matrix<double, DIMU, DIMU>::Identity());
-Eigen::Matrix<double, 12, 12> I12(Eigen::Matrix<double, 12, 12>::Identity());
+inline Eigen::Matrix3d I33(Eigen::Matrix3d::Identity());
+inline Eigen::Matrix<double, DIMU, DIMU> I_imu(Eigen::Matrix<double, DIMU, DIMU>::Identity());
+inline Eigen::Matrix<double, 12, 12> I12(Eigen::Matrix<double, 12, 12>::Identity());
 
 class VOXEL_LOC
 {
@@ -59,7 +59,7 @@ namespace std
   };
 }
 
-Eigen::Matrix3d Exp(const Eigen::Vector3d &ang)
+inline Eigen::Matrix3d Exp(const Eigen::Vector3d &ang)
 {
   double ang_norm = ang.norm();
   // if (ang_norm >= 0.0000001)
@@ -76,7 +76,7 @@ Eigen::Matrix3d Exp(const Eigen::Vector3d &ang)
   
 }
 
-Eigen::Matrix3d Exp(const Eigen::Vector3d &ang_vel, const double &dt)
+inline Eigen::Matrix3d Exp(const Eigen::Vector3d &ang_vel, const double &dt)
 {
   double ang_vel_norm = ang_vel.norm();
   if (ang_vel_norm > 0.0000001)
@@ -95,14 +95,14 @@ Eigen::Matrix3d Exp(const Eigen::Vector3d &ang_vel, const double &dt)
   
 }
 
-Eigen::Vector3d Log(const Eigen::Matrix3d &R)
+inline Eigen::Vector3d Log(const Eigen::Matrix3d &R)
 {
   double theta = (R.trace() > 3.0 - 1e-6) ? 0.0 : std::acos(0.5 * (R.trace() - 1));
   Eigen::Vector3d K(R(2,1) - R(1,2), R(0,2) - R(2,0), R(1,0) - R(0,1));
   return (std::abs(theta) < 0.001) ? (0.5 * K) : (0.5 * theta / std::sin(theta) * K);
 }
 
-Eigen::Matrix3d hat(const Eigen::Vector3d &v)
+inline Eigen::Matrix3d hat(const Eigen::Vector3d &v)
 {
   Eigen::Matrix3d Omega;
   Omega <<  0, -v(2),  v(1)
@@ -111,7 +111,7 @@ Eigen::Matrix3d hat(const Eigen::Vector3d &v)
   return Omega;
 }
 
-Eigen::Matrix3d jr(Eigen::Vector3d vec)
+inline Eigen::Matrix3d jr(Eigen::Vector3d vec)
 {
   double ang = vec.norm();
 
@@ -127,7 +127,7 @@ Eigen::Matrix3d jr(Eigen::Vector3d vec)
   }
 }
 
-Eigen::Matrix3d jr_inv(const Eigen::Matrix3d &rotR)
+inline Eigen::Matrix3d jr_inv(const Eigen::Matrix3d &rotR)
 {
   Eigen::AngleAxisd rot_vec(rotR);
   Eigen::Vector3d axi = rot_vec.axis();
@@ -358,7 +358,7 @@ void down_sampling_voxel2(pcl::PointCloud<PointT> &pl_feat, double voxel_size)
   pl_feat.is_dense = true;
 }
 
-void down_sampling_serie(pcl::PointCloud<PointType> &pl_feat, int num)
+inline void down_sampling_serie(pcl::PointCloud<PointType> &pl_feat, int num)
 {
   if(num < 1) num = 1;
 
@@ -370,7 +370,7 @@ void down_sampling_serie(pcl::PointCloud<PointType> &pl_feat, int num)
   pl_feat.swap(pl_down);
 }
 
-void pl_transform(pcl::PointCloud<PointType> &pl1, const Eigen::Matrix3d &rr, const Eigen::Vector3d &tt)
+inline void pl_transform(pcl::PointCloud<PointType> &pl1, const Eigen::Matrix3d &rr, const Eigen::Vector3d &tt)
 {
   for(PointType &ap : pl1.points)
   {
@@ -382,7 +382,7 @@ void pl_transform(pcl::PointCloud<PointType> &pl1, const Eigen::Matrix3d &rr, co
   }
 }
 
-void pl_transform(pcl::PointCloud<PointType> &pl1, const IMUST &xx)
+inline void pl_transform(pcl::PointCloud<PointType> &pl1, const IMUST &xx)
 {
   for(PointType &ap : pl1.points)
   {
@@ -394,7 +394,7 @@ void pl_transform(pcl::PointCloud<PointType> &pl1, const IMUST &xx)
   }
 }
 
-void plvec_trans(PLV(3) &porig, PLV(3) &ptran, IMUST &stat)
+inline void plvec_trans(PLV(3) &porig, PLV(3) &ptran, IMUST &stat)
 {
   uint asize = porig.size();
   ptran.resize(asize);
@@ -402,7 +402,7 @@ void plvec_trans(PLV(3) &porig, PLV(3) &ptran, IMUST &stat)
     ptran[i] = stat.R * porig[i] + stat.p;
 }
 
-bool time_compare(PointType &x, PointType &y) {return (x.curvature < y.curvature);}
+inline bool time_compare(PointType &x, PointType &y) {return (x.curvature < y.curvature);}
 
 class PointCluster
 {
@@ -475,7 +475,7 @@ normvec:  normalized x0
 */
 
 const double threshold = 0.1;
-bool esti_plane(Eigen::Vector4d &pca_result, const pcl::PointCloud<PointType> &point)
+inline bool esti_plane(Eigen::Vector4d &pca_result, const pcl::PointCloud<PointType> &point)
 {
   Eigen::Matrix<double, NMATCH, 3> A;
   Eigen::Matrix<double, NMATCH, 1> b;
