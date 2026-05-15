@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Template: per-dataset Global-LVBA runner
+# =============================================================================
+#
+# Copy this script into a dataset directory (next to all_image/, all_pcd_body/,
+# Colmap/, and the dataset's lvba_config.yaml). It self-locates so the dataset
+# folder doesn't need to be in any specific path. Run it from anywhere:
+#
+#   /path/to/dataset/run_lvba.sh
+#
+# What it does:
+#   1. Determines its own directory (= the dataset directory).
+#   2. Bind-mounts the Global-LVBA repo into the container at /opt/lvba so
+#      the built binary at /opt/lvba/build/lvba_run is available.
+#   3. Bind-mounts THIS dataset directory at /opt/lvba/dataset/<SEQ_NAME> so
+#      the YAML's `data_path: "dataset/<SEQ_NAME>/"` resolves correctly inside
+#      the container.
+#   4. Runs lvba_run with the dataset's yaml as argv[1].
+#   5. Pauses on exit (success or crash) so the terminal stays open to read
+#      the result; tees stdout/stderr to <dataset>/lvba_run.log for later.
+#
+# What you need to edit (look for {{ ... }} markers below):
+#   - LVBA_REPO     : path to your cloned Global-LVBA repo on host
+#   - LVBA_IMAGE    : docker image tag (default 'lvba:dev')
+#   - GPU_FLAG      : '--gpus all' to use GPU, empty for CPU-only
+#   - YAML_NAME     : name of the per-dataset YAML in this folder
+#   - SEQ_NAME is derived automatically from the folder name. Override if your
+#     YAML's `data_path` uses a different name.
+# =============================================================================
+
+set -euo pipefail
+
+DATASET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SEQ_NAME="$(basename "${DATASET_DIR}")"      # {{SEQ_NAME, defaults to folder name}}
+YAML_NAME="lvba_config.yaml"                 # {{YAML_NAME}}
+
+LVBA_REPO="${HOME}/lvba_ws/Global-LVBA"      # {{LVBA_REPO}} -- edit if elsewhere
+LVBA_IMAGE="lvba:dev"                        # {{LVBA_IMAGE}}
+GPU_FLAG="--gpus all"                        # {{GPU_FLAG}} -- empty for CPU
+
+LOG_FILE="${DATASET_DIR}/lvba_run.log"
+
+docker run ${GPU_FLAG} --rm -it \
+    --user "$(id -u):$(id -g)" \
+    -v "${LVBA_REPO}":/opt/lvba \
+    -v "${DATASET_DIR}":/opt/lvba/dataset/"${SEQ_NAME}" \
+    "${LVBA_IMAGE}" \
+    bash -c "
+        trap '
+            echo;
+            echo \"---\";
+            echo \"lvba_run exited with status \$? (signal-based exits show 128+signal)\";
+            echo \"Log saved to: /opt/lvba/dataset/${SEQ_NAME}/lvba_run.log\";
+            echo \"Output dirs (if any reached):\";
+            echo \"  /opt/lvba/dataset/${SEQ_NAME}/Colmap/sparse/  (refined poses + 3D points)\";
+            echo \"  /opt/lvba/dataset/${SEQ_NAME}/depth/          (per-image depth maps)\";
+            echo \"  /opt/lvba/dataset/${SEQ_NAME}/reproj/         (reprojection visualisations)\";
+            echo \"Press Enter to close.\";
+            read
+        ' EXIT
+        /opt/lvba/build/lvba_run /opt/lvba/dataset/${SEQ_NAME}/${YAML_NAME} 2>&1 \
+            | tee /opt/lvba/dataset/${SEQ_NAME}/lvba_run.log
+        exit \${PIPESTATUS[0]}
+    "

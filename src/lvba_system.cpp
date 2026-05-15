@@ -435,13 +435,24 @@ bool LvbaSystem::loadFromColmapDB()
     }
     std::cout << "[DB] ColmapDB images count = " << db_image_count << "\n";
 
-    if (db_image_count != images_ids_.size()) {
+    // Relaxed: accept a db that is a SUPERSET of what the strided dataset
+    // wants. Upstream rejected anything non-equal and fell through to a
+    // SiftGPU rebuild which needs an X display (fails in headless
+    // containers anyway). All we actually need is that every dataset image
+    // has a name->id entry in the db; name2id is populated above so the
+    // post-load lookup handles supersets transparently.
+    if (db_image_count < (int64_t)images_ids_.size()) {
         std::cerr << "[DB] Warning: DB images count (" << db_image_count
-                  << ") != dataset images count (" << images_ids_.size() << ")\n";
-        // 构建新的 数据库
+                  << ") < dataset images count (" << images_ids_.size()
+                  << ") -- need to (re)build matches.\n";
         std::cout << "[DB] Rebuilding COLMAP database...\n";
         sqlite3_close(db);
         return false;
+    }
+    if (db_image_count != (int64_t)images_ids_.size()) {
+        std::cout << "[DB] Note: DB images count (" << db_image_count
+                  << ") > dataset images count (" << images_ids_.size()
+                  << "); using the dataset subset (name-based lookup).\n";
     }
 
     ts2idx.clear();
