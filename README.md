@@ -5,7 +5,7 @@ BA refinement after LiDAR-inertial-visual odometry (e.g. FAST-LIVO2 or any
 SLAM that produces per-frame camera + LiDAR poses).
 
 This is a fork of [xuankuzcr/Global-LVBA](https://github.com/xuankuzcr/Global-LVBA)
-with two changes:
+with several changes:
 
 1. **ROS dependency stripped.** The original is a catkin/ROS1 package; we
    replaced the few ROS APIs it actually used (NodeHandle::param,
@@ -16,6 +16,15 @@ with two changes:
    Eigen, OpenCV, PCL, GLEW/GLUT, legacy Sophus from source, etc.) are pinned
    in a `Dockerfile`. Build the image once, mount your source + dataset at
    runtime, iterate without polluting your host.
+3. **Pre-rendered depth-map support** (`use_existing_depthmap` YAML flag) to
+   bypass LVBA's native voxel-projection depth gen when the upstream pipeline
+   (e.g. GLIM's virtual-LiDAR-cameras tool) can produce richer per-camera
+   depth maps with edge-aware gap-fill. Particularly useful for forward-facing
+   MMS rigs with narrow-vertical-FOV LiDARs (Livox Horizon class, 25° V FOV)
+   where native depth gen tops out at ~1.5% per-image pixel coverage. See
+   [Patches in this fork](#patches-in-this-fork) for details.
+4. **Multi-extension image-path resolver, configurable depth-merge window,
+   diagnostic tracing**, and other small ergonomics — listed below.
 
 The algorithm itself (BALM LiDAR BA + visual BA via Ceres + point-plane
 residual against the LiDAR cloud) is unchanged. See the [upstream paper /
@@ -36,6 +45,24 @@ repo](https://github.com/xuankuzcr/Global-LVBA) for the algorithmic details.
 - For GPU runs: NVIDIA driver + `nvidia-container-toolkit`. CPU-only also works
   (drop `--gpus all` from the run script).
 
+### Build / install flow at a glance
+
+There are **three distinct stages** here; the words "build" mean different
+things at each one. Confusing the three is the most common gotcha for new
+users, so it's worth being explicit:
+
+| Stage | What it produces | Frequency | Where it happens |
+|---|---|---|---|
+| **1. Image build** (`docker build`) | A reusable Docker image (`lvba:dev`) containing the OS, Eigen/OpenCV/PCL/Ceres/Sophus/GLEW/etc. **No LVBA source** is compiled into the image. | **Once** (re-do only if deps change) | Host shell, takes ~10-20 min the first time |
+| **2. Binary build** (`cmake .. && make -j`) | The `build/lvba_run` executable in your source tree, built against the image's dependencies. | **When source changes** | Inside an interactive container that bind-mounts your source |
+| **3. Run** (`run_lvba.sh`) | LVBA actually executing on a dataset. | **Every time you process a dataset** | A fresh ephemeral container per run; container exits on completion |
+
+The image is a sealed environment that the binary build + every run launch
+from. Your **source code lives on the host** and is bind-mounted into the
+container at `/opt/lvba`; the binary lands in `<repo>/build/lvba_run` on the
+host filesystem because of the mount. **You do not rebuild the image when you
+edit source code** — just the binary inside the container.
+
 ### One-time setup
 
 ```bash
@@ -44,23 +71,47 @@ git clone https://github.com/TokyoWarfare/Global-LVBA-ROS-FREE.git ~/lvba_ws/Glo
 cd ~/lvba_ws/Global-LVBA
 git submodule update --init --recursive
 
-# 2. Build the Docker image (~10-20 min first time; only deps install,
-#    no source compiled in the image)
+# 2. Build the Docker image (stage 1 above; once)
 docker build -t lvba:dev .
 
-# 3. Drop into the container, compile SiftGPU + LVBA (source is mounted
-#    from your host, so build artefacts land in ~/lvba_ws/Global-LVBA/build/)
+# 3. Build SiftGPU + LVBA binaries (stage 2 above; first time only).
+#    The container bind-mounts your source so artefacts land on the host.
 docker run --gpus all --rm -it \
     -v ~/lvba_ws/Global-LVBA:/opt/lvba \
+    -v /data:/data \
     lvba:dev
 # inside the container:
-cd /opt/lvba/src/SiftGPU && mkdir -p build && cd build && cmake .. && make -j
-cd /opt/lvba && mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make -j
+cd /opt/lvba/src/SiftGPU && mkdir -p build && cd build && cmake .. && make -j$(nproc)
+cd /opt/lvba && mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make -j$(nproc)
 exit
 ```
 
-After the second `make`, the LVBA binary is at `~/lvba_ws/Global-LVBA/build/lvba_run`
-on your host (same path the container sees, because the source is bind-mounted).
+After the second `make`, `lvba_run` is at `~/lvba_ws/Global-LVBA/build/lvba_run`
+on your host (same path the container sees through the bind mount).
+
+### Re-building after source edits
+
+You don't need an interactive shell; one-shot is fine:
+
+```bash
+docker run --gpus all --rm \
+    -v ~/lvba_ws/Global-LVBA:/opt/lvba \
+    -v /data:/data \
+    lvba:dev \
+    bash -c "cd /opt/lvba/build && make -j\$(nproc)"
+```
+
+If CMake's cache somehow points at a wrong path (rare; happens if a previous
+build was launched from a different host-side path), nuke and reconfigure:
+
+```bash
+docker run --gpus all --rm \
+    -v ~/lvba_ws/Global-LVBA:/opt/lvba \
+    -v /data:/data \
+    lvba:dev \
+    bash -c "cd /opt/lvba && rm -rf build && mkdir build && cd build && \
+             cmake -DCMAKE_BUILD_TYPE=Release .. && make -j\$(nproc)"
+```
 
 ### Running on a dataset
 
@@ -145,18 +196,36 @@ extrin_calib:
 
 data_config:
   data_path: "dataset/<seq_name>/"    # relative to /opt/lvba
-  colmap_db_path: "Colmap/colmap_sub5.db"
-  image_sample_step: 5                # use every Nth image
+  colmap_db_path: "Colmap/match.db"   # or colmap_sub5.db for the upstream sample
+  image_sample_step: 1                # 1 for GLIM-exported (already pruned), 5 upstream
   enable_lidar_ba: false              # BALM LiDAR-side optimisation
   enable_visual_ba: true              # main visual + point-plane BA
+  # ---- this-fork additions: ----
+  use_existing_depthmap: true         # read PNGs from <depthmap_dir> instead
+                                       # of voxel-projecting
+  depthmap_dir: "depth/"               # relative to data_path
+  depthmap_scale_per_m: 100.0          # 16-bit PNG: depth_m = pixel_value / scale
+
+depth_merge:
+  half_window_s: 10.0                  # ±N s LiDAR-scan merge per image
+                                        # (this-fork: upstream was hardcoded 0.5)
+
+track_fusion:                          # track filter thresholds
+  inlier_radius_m: 0.5                 # 3D scatter tolerance per track (m)
+  reproj_mean_thr: 12.0                # post-fusion mean reproj cap (px)
+  min_view_angle: 1.0                  # baseline angle gate (deg)
 
 window_ba, BALM_stage1, BALM_stage2:  # tuning knobs; see upstream paper
-track_fusion:                          # track filter thresholds
+
 colmap_output:
   enable: true                         # write refined poses to
                                        # Colmap/sparse/images.txt and a
                                        # merged colored cloud
 ```
+
+The full example with all keys is at `config/config.yaml`; GLIM's Dataset
+Export → LVBA target emits a populated YAML per-dataset, so you usually
+don't write these by hand.
 
 ---
 
@@ -184,9 +253,11 @@ from the `.db`. The schema is documented at
 
 ---
 
-## What got patched (for upstream consumers)
+## Patches in this fork
 
 If you're cross-referencing this fork against upstream:
+
+### Initial port (ROS-free + Dockerised)
 
 - `include/ros_shim.h` — new, header-only YAML-config + no-op publisher
   stubs. Replaces the 4-5 ROS APIs the original used.
@@ -203,8 +274,107 @@ If you're cross-referencing this fork against upstream:
 - `package.xml`, `launch/`, `rviz_cfg/` — deleted (ROS-only artefacts).
 
 The visualization publishers were no-ops in the shim, so the algorithm's
-output is identical to running the upstream version. Tested on
-Retail_Street from the LVBA-Dataset.
+output is identical to running the upstream version on Retail_Street.
+
+### Pipeline patches for MMS / GLIM integration
+
+The original Global-LVBA targets handheld close-range capture (Retail_Street:
+walker, ~1.5 m/s, facade at 4 m, dense LiDAR returns on every feature).
+Mobile-mapping data (vehicle, 40 km/h, features at 20-30 m, narrow-V-FOV
+LiDAR) breaks several upstream assumptions. Patches added during MMS
+integration testing:
+
+- **`use_existing_depthmap` short-circuit** in `generateDepthWithVoxel`
+  (`src/lvba_system.cpp` ~line 847). When the YAML's
+  `data_config/use_existing_depthmap: true` is set, the function reads
+  per-image 16-bit PNGs from `<dataset>/<depthmap_dir>/<timestamp>.png`
+  instead of running the voxel-projection pass. Decodes with
+  `cv::imread(IMREAD_UNCHANGED)` and converts to `CV_32FC1` via
+  `depthmap_scale_per_m` (units per metre; 100 = 1 cm quantum, max ~655 m
+  range with 16-bit headroom). New YAML keys:
+  ```yaml
+  data_config:
+    use_existing_depthmap: true
+    depthmap_dir: "depth/"
+    depthmap_scale_per_m: 100.0
+  ```
+  **Why**: native voxel projection on Livox-Horizon-class LiDARs (25° V FOV)
+  gives ~1.5% per-image pixel coverage on a 4K camera at 4-5 m feature
+  distances, because the LiDAR doesn't return on the upper half of the
+  image and the camera's FOV is wider than the LiDAR's. Pre-rendered maps
+  from GLIM's Virtual-LiDAR-Cameras pipeline (accumulated submap context,
+  splat-tuned, edge-aware gap-fill) reach 55%+ coverage at the same scale,
+  which makes `fetchDepthBilinear` actually return values at most keypoint
+  pixels — the difference between LVBA producing tracks and not.
+
+- **`getImagePath` multi-extension fallback** (`src/lvba_system.cpp` near
+  line ~2287). Upstream hardcoded `.png`; GLIM exports `.jpg` by default
+  (smaller, lossless-equivalent for SfM use). New behaviour:
+  ```cpp
+  for (const char* ext : {".png", ".jpg", ".jpeg", ".bmp"}) {
+      if (std::filesystem::exists(base + ext)) return base + ext;
+  }
+  ```
+  Falls through to `.png` for backward compatibility with Retail_Street.
+  **Why**: makes the GLIM → LVBA round-trip work without renaming images.
+
+- **Depth-merge half-window surfaced from hardcoded default to YAML key**
+  (`src/lvba_system.cpp` ~line 24).
+  ```yaml
+  depth_merge:
+    half_window_s: 10.0   # ±10s of LiDAR scans merged per image
+  ```
+  Upstream's `nh_.param` reads this key already, but the default 0.5 s is
+  Retail_Street-tuned (close range, dense returns, no temporal accumulation
+  needed). MMS rigs benefit from a much wider window — 10 s densifies
+  per-image depth coverage by pulling in adjacent sweeps. Now consistently
+  emitted by GLIM's LVBA-target YAML writer at the MMS-appropriate value.
+
+- **Diagnostic tracing** throughout the pipeline. Stderr-flushing prints
+  bracketing every major stage (`[Pipeline/trace]`, `[DB/trace]`,
+  `[Frontend/trace]`, `[BuildTracks/trace]`, `[OptBA/trace]`) and inside
+  the BALM `cut_voxel` / `recut` loops. **Why**: when LVBA misbehaves on
+  unfamiliar data, it tends to silently exit with status 0 (e.g. SIGSEGV
+  intercepted by GLIM's crash handler, tee gobbling the real exit code).
+  The traces pinpoint the actual failure stage in minutes instead of
+  bisecting via code edits + rebuild cycles. Negligible runtime cost.
+
+- **Track filter breakdown counters** (`src/lvba_system.cpp`
+  `BuildTracksAndFuse3D`). The per-gate counts (`small_comp`, `no_depth`,
+  `dist_inl`, `dedup_img`, `rep_cnt`, `rep_mean`, `view_ang`) print at end
+  of track building so the user can see which gate is killing the most
+  candidates and tune accordingly. The same six gates exist in upstream
+  but their drop counts weren't surfaced.
+
+### Tuning thresholds (different from upstream defaults)
+
+The upstream YAML defaults are tuned for Retail_Street. The defaults
+emitted by GLIM's LVBA-target export are tuned for MMS regimes:
+
+|  | Upstream | GLIM-emitted (MMS) | Rationale |
+|---|---|---|---|
+| `inlier_radius_m` | 0.12 | 0.5 | At 5-12 m feature distance with 1-2° calibration drift, real per-observation scatter is 15-50 cm. 0.12 kills genuine tracks; 0.5 absorbs the drift without letting outliers through. |
+| `reproj_mean_thr` | 3.0 | 12.0 (was 5.0) | Pre-BA reprojection noise floor on depth-based 3D is 5-15 px at MMS distances. 3 px kills almost everything; 12 px lets BA receive enough constraints to refine cameras. |
+| `min_view_angle` | 8.0 | 1.0 (was 5.0) | Forward-camera + forward motion produces near-zero parallax for on-axis features (the geometry where Retail_Street's walker-vs-facade had 10°+ per frame). Lowering the gate keeps these tracks. |
+| `depth_merge/half_window_s` | 0.5 | 10.0 | See above. |
+| `image_sample_step` | 5 | 1 | GLIM's export already prunes cameras by min-spacing in Colorize; LVBA doesn't need to subsample further. |
+
+### Empirical results (MMS test sequence, May 2026)
+
+Validation runs on a forward-facing 4K MMS sequence (40 km/h vehicle,
+Livox Horizon LiDAR, ~200 cameras per tile after region clipping):
+
+| Config | Kept tracks | Post-BA mean | BA status |
+|---|---|---|---|
+| Native voxel depth + upstream thresholds | <100 | — | DNF (small_comp >99%) |
+| Pre-rendered depth (gap=0, /4) + GLIM thresholds | 1,235 | 9.5 px | CONVERGENCE |
+| **+ depth-mask filtered match.db (LightGlue)** | **3,519** | **7 px** | **CONVERGENCE** (10 iters) |
+
+The depth-mask filter (GLIM-side, drops pair-matches where neither
+endpoint falls on a depth-covered pixel) removes ~40% of junk matches in
+SIFT and proportionally more for LightGlue, while *increasing* surviving
+track count and lowering BA cost. Combined with the pre-rendered depth
+path, this is the canonical MMS workflow.
 
 ---
 

@@ -136,11 +136,21 @@ public:
     std::vector<Eigen::Vector3d> tcw_all_, tcw_all_optimized_;
 
     int obser_thr_ = 3;
+    double inlier_radius_m_ = 0.12;  // track-build distance threshold (m). YAML: track_fusion/inlier_radius_m
+    double depth_merge_half_w_s_ = 0.5;  // half-width (s) of per-image depth merge window. YAML: depth_merge/half_window_s
     std::ofstream fout_points_after, fout_points_before, fout_poses_after, fout_poses_before;
 
     double min_view_angle_deg_, reproj_mean_thr_px_, filter_size_points3D_;
 
     bool colmap_output_enable_;
+
+    // Pre-rendered depth maps (GLIM-side export). YAML:
+    //   data_config/use_existing_depthmap    (bool, default false)
+    //   data_config/depthmap_dir             (string, relative to data_path, default "depth/")
+    //   data_config/depthmap_scale_per_m     (double, units per metre, default 100.0)
+    bool use_existing_depthmap_ = false;
+    std::string depthmap_dir_;
+    double depthmap_scale_per_m_ = 100.0;
 };
 
 }

@@ -20,9 +20,19 @@ LvbaSystem::LvbaSystem(ros::NodeHandle& nh) : nh_(nh)
     nh_.param<bool>("data_config/enable_visual_ba", enable_visual_ba_, true);
     nh_.param<double>("track_fusion/min_view_angle", min_view_angle_deg_, 8.0);
     nh_.param<double>("track_fusion/reproj_mean_thr", reproj_mean_thr_px_, 3.0);
+    nh_.param<double>("track_fusion/inlier_radius_m", inlier_radius_m_, 0.12);
+    nh_.param<double>("depth_merge/half_window_s", depth_merge_half_w_s_, 0.5);
 
     nh_.param<bool>("colmap_output/enable", colmap_output_enable_, true);
     nh_.param<double>("colmap_output/filter_size_points3D", filter_size_points3D_, 0.01);
+
+    // Pre-rendered depth maps (GLIM-side export). When ON, generateDepthWithVoxel
+    // short-circuits to cv::imread on the exported PNGs instead of running the
+    // voxel-projection pass. Bypasses the 4-neighbour bilinear coverage
+    // bottleneck for wide-FOV cameras with narrow-V-FOV LiDARs.
+    nh_.param<bool>("data_config/use_existing_depthmap", use_existing_depthmap_, false);
+    nh_.param<std::string>("data_config/depthmap_dir", depthmap_dir_, std::string("depth/"));
+    nh_.param<double>("data_config/depthmap_scale_per_m", depthmap_scale_per_m_, 100.0);
 }
 
 void LvbaSystem::runFullPipeline() 
@@ -35,11 +45,19 @@ void LvbaSystem::runFullPipeline()
 
 void LvbaSystem::runVisualBAWithLidarAssist()
 {
+    std::cerr << "[Pipeline/trace] runVisualBAWithLidarAssist start" << std::endl;
+    std::cerr << "[Pipeline/trace] -> buildGridMapFromOptimized" << std::endl;
     buildGridMapFromOptimized();
+    std::cerr << "[Pipeline/trace] -> updateCameraPosesFromLidar" << std::endl;
     updateCameraPosesFromLidar();
+    std::cerr << "[Pipeline/trace] -> generateDepthWithVoxel" << std::endl;
     generateDepthWithVoxel();
+    std::cerr << "[Pipeline/trace] -> extractAndMatchFeaturesGPU" << std::endl;
     extractAndMatchFeaturesGPU();
+    std::cerr << "[Pipeline/trace] -> BuildTracksAndFuse3D" << std::endl;
     BuildTracksAndFuse3D();
+    std::cerr << "[Pipeline/trace] -> optimizeCameraPoses (tracks_.size()="
+              << tracks_.size() << ")" << std::endl;
     optimizeCameraPoses();
     visualizeProj();
     pubRGBCloud();
@@ -401,6 +419,9 @@ void LvbaSystem::initFromDatasetIO() {
 // 但要确保项目已链接 DevIL、GLEW/GLUT（SiftGPU 依赖）
 bool LvbaSystem::loadFromColmapDB()
 {
+    std::cerr << "[DB/trace] enter loadFromColmapDB; colmap_db_path=" << dataset_io_->colmap_db_path_
+              << "; image_pairs_.size()=" << image_pairs_.size()
+              << "; images_ids_.size()=" << images_ids_.size() << std::endl;
     constexpr uint64_t kColmapMaxNumImages = (1ull << 31) - 1;
     auto imageIdsToPairId = [kColmapMaxNumImages](uint32_t image_id1, uint32_t image_id2) -> uint64_t {
         if (image_id1 > image_id2) {
@@ -433,7 +454,8 @@ bool LvbaSystem::loadFromColmapDB()
         }
         sqlite3_finalize(stmt);
     }
-    std::cout << "[DB] ColmapDB images count = " << db_image_count << "\n";
+    std::cerr << "[DB/trace] after images SELECT; db_image_count=" << db_image_count << std::endl;
+    std::cout << "[DB] ColmapDB images count = " << db_image_count << std::endl;
 
     // Relaxed: accept a db that is a SUPERSET of what the strided dataset
     // wants. Upstream rejected anything non-equal and fell through to a
@@ -462,14 +484,26 @@ bool LvbaSystem::loadFromColmapDB()
     }
 
     // 辅助函数：根据时间戳查找对应的图像 ID
+    static int s_diag_misses = 0;
+    static int s_diag_hits   = 0;
     auto imageIdOfTs = [&](double ts)->int {
         std::string p = getImagePath(ts);
         std::string base = fs::path(p).filename().string();
         auto it1 = name2id.find(base);
-        if (it1 != name2id.end()) return (int)it1->second;
+        if (it1 != name2id.end()) { ++s_diag_hits; return (int)it1->second; }
+        if (s_diag_misses < 5) {
+            std::cerr << "[imageIdOfTs/miss] ts=" << std::setprecision(15) << ts
+                      << " synth='" << base << "' (looked up in name2id which has "
+                      << name2id.size() << " entries; first entry: '";
+            if (!name2id.empty()) std::cerr << name2id.begin()->first;
+            std::cerr << "')" << std::endl;
+        }
+        ++s_diag_misses;
         return -1;
     };
 
+    std::cerr << "[DB/trace] starting keypoints load loop ("
+              << images_ids_.size() << " images)" << std::endl;
     // 2) 读取 keypoints 表并写入 all_keypoints_
     if ((int)all_keypoints_.size() < (int)images_ids_.size())
         all_keypoints_.resize(images_ids_.size());
@@ -511,6 +545,21 @@ bool LvbaSystem::loadFromColmapDB()
         sqlite3_finalize(stmt);
     }
 
+    {
+        size_t loaded_kp_images = 0;
+        size_t empty_kp_images = 0;
+        for (const auto& kv : all_keypoints_) {
+            if (kv.empty()) ++empty_kp_images;
+            else ++loaded_kp_images;
+        }
+        std::cerr << "[DB/trace] after keypoints loop; loaded="
+                  << loaded_kp_images << " empty=" << empty_kp_images
+                  << " (total all_keypoints_=" << all_keypoints_.size() << ")"
+                  << std::endl;
+    }
+
+    std::cerr << "[DB/trace] starting two_view_geometries load loop ("
+              << image_pairs_.size() << " pairs)" << std::endl;
     // 3) 读取 two_view_geometries 表并写入 all_matches_（只读取内点匹配）
     all_matches_.assign(image_pairs_.size(), {});
     {
@@ -583,12 +632,26 @@ bool LvbaSystem::loadFromColmapDB()
     }
 
     sqlite3_close(db);
-    std::cout << "[DB] Loaded keypoints & inlier matches from " << dataset_io_->colmap_db_path_ << "\n";
+    {
+        size_t pairs_with_matches = 0;
+        size_t total_matches = 0;
+        for (const auto& v : all_matches_) {
+            if (!v.empty()) ++pairs_with_matches;
+            total_matches += v.size();
+        }
+        std::cerr << "[DB/trace] finished two_view loop; pairs_with_matches="
+                  << pairs_with_matches << " / " << all_matches_.size()
+                  << "  total_matches=" << total_matches << std::endl;
+    }
+    std::cout << "[DB] Loaded keypoints & inlier matches from " << dataset_io_->colmap_db_path_ << std::endl;
     return true;
 }
 
 void LvbaSystem::extractAndMatchFeaturesGPU()
 {
+    std::cerr << "[Frontend/trace] enter extractAndMatchFeaturesGPU; "
+              << "image_pairs_.size()=" << image_pairs_.size()
+              << " images_ids_.size()=" << images_ids_.size() << std::endl;
     // ts -> 顺序下标映射, 保持 all_keypoints_ 的按序存储
     std::unordered_map<double, int> ts2idx;
     ts2idx.reserve(images_ids_.size());
@@ -597,9 +660,12 @@ void LvbaSystem::extractAndMatchFeaturesGPU()
     if ((int)all_keypoints_.size() < (int)images_ids_.size())
         all_keypoints_.resize(images_ids_.size());
 
-    if (loadFromColmapDB()) {
+    std::cerr << "[Frontend/trace] calling loadFromColmapDB..." << std::endl;
+    const bool db_ok = loadFromColmapDB();
+    std::cerr << "[Frontend/trace] loadFromColmapDB returned " << (db_ok ? "true" : "false") << std::endl;
+    if (db_ok) {
         std::cout << "[Frontend] Using existing COLMAP DB: "
-                  << dataset_io_->colmap_db_path_ << "\n";
+                  << dataset_io_->colmap_db_path_ << std::endl;
         return;  // 已经拿到结果，直接返回
     }
 
@@ -735,7 +801,7 @@ void LvbaSystem::extractAndMatchFeaturesGPU()
     std::cout << std::endl;
 }
 
-void LvbaSystem::generateDepthWithVoxel() 
+void LvbaSystem::generateDepthWithVoxel()
 {
     const size_t N = all_voxel_ids_.size();
     if (poses_.size() != N) {
@@ -747,13 +813,117 @@ void LvbaSystem::generateDepthWithVoxel()
                   << ", voxel_ids=" << N << std::endl;
     }
 
-    // std::cout << "all_voxel_ids_.size(): " << N << std::endl;
-
     Rcw_all_.clear(); tcw_all_.clear(); Rcw_all_optimized_.clear(); tcw_all_optimized_.clear(); all_depths_.clear();
     Rcw_all_.reserve(N); tcw_all_.reserve(N); Rcw_all_optimized_.reserve(N); tcw_all_optimized_.reserve(N); all_depths_.reserve(N);
+
+    // Always populate Rcw_all_ / tcw_all_ from poses (both original + current)
+    // regardless of whether we generate depth maps here or read them from disk.
+    // Downstream BA still consumes these.
+    auto build_camera_chains = [&]() {
+        for (size_t id = 0; id < N; ++id) {
+            const Sophus::SE3& T_W_I_opt = poses_[id];
+            const Eigen::Matrix3d Rwi_opt = T_W_I_opt.rotation_matrix();
+            const Eigen::Vector3d Pwi_opt = T_W_I_opt.translation();
+            Eigen::Matrix3d Rcw_opt = Rci_ * Rwi_opt.transpose();
+            Eigen::Vector3d tcw_opt = -Rcw_opt * Pwi_opt + tci_;
+            Rcw_all_optimized_.push_back(Rcw_opt);
+            tcw_all_optimized_.push_back(tcw_opt);
+
+            const Sophus::SE3& T_W_I_orig = poses_before_[id];
+            const Eigen::Matrix3d Rwi_orig = T_W_I_orig.rotation_matrix();
+            const Eigen::Vector3d Pwi_orig = T_W_I_orig.translation();
+            Eigen::Matrix3d Rcw_orig = Rci_ * Rwi_orig.transpose();
+            Eigen::Vector3d tcw_orig = -Rcw_orig * Pwi_orig + tci_;
+            Rcw_all_.push_back(Rcw_orig);
+            tcw_all_.push_back(tcw_orig);
+        }
+    };
+
+    // Pre-rendered depth maps short-circuit. When the GLIM-side LVBA export
+    // emitted depth/<%.6f stamp>.png files (16-bit, scale = depthmap_scale_per_m
+    // units per metre), skip voxel-projection entirely and load straight from
+    // disk. Bypasses the 4-neighbour bilinear coverage bottleneck for
+    // wide-FOV cameras with narrow-V-FOV LiDARs.
+    if (use_existing_depthmap_) {
+        std::cout << "[generateDepthWithVoxel] use_existing_depthmap=true, "
+                     "reading " << N << " PNG(s) from " << depthmap_dir_ << std::endl;
+        build_camera_chains();
+        const double inv_scale = (depthmap_scale_per_m_ > 0) ? 1.0 / depthmap_scale_per_m_ : 1.0;
+        long long total_pixels = 0;
+        long long total_nonzero = 0;
+        double depth_min_seen = 1e30;
+        double depth_max_seen = -1e30;
+        size_t missing = 0;
+        for (size_t id = 0; id < N; ++id) {
+            std::ostringstream oss;
+            oss.setf(std::ios::fixed); oss << std::setprecision(6) << images_ids_[id];
+            const std::string path = dataset_path_ + depthmap_dir_ + oss.str() + ".png";
+            cv::Mat raw = cv::imread(path, cv::IMREAD_UNCHANGED);
+            if (raw.empty() || raw.type() != CV_16UC1) {
+                if (missing < 5) {
+                    std::cerr << "[generateDepthWithVoxel] missing or non-16UC1 depth PNG: "
+                              << path << std::endl;
+                }
+                missing++;
+                // Push an empty depth so downstream indexing stays aligned;
+                // fetchDepthBilinear will reject every lookup against an empty
+                // map (all 4 neighbours = 0).
+                all_depths_.push_back(cv::Mat::zeros(image_height_, image_width_, CV_32FC1));
+                continue;
+            }
+            cv::Mat depth32;
+            raw.convertTo(depth32, CV_32FC1, inv_scale);
+            // Coverage stats (same as the voxel-gen path).
+            for (int r = 0; r < depth32.rows; ++r) {
+                const float* row = depth32.ptr<float>(r);
+                for (int c = 0; c < depth32.cols; ++c) {
+                    const float v = row[c];
+                    if (v > 0.0f) {
+                        total_nonzero++;
+                        if ((double)v < depth_min_seen) depth_min_seen = v;
+                        if ((double)v > depth_max_seen) depth_max_seen = v;
+                    }
+                }
+            }
+            total_pixels += static_cast<long long>(depth32.rows) *
+                             static_cast<long long>(depth32.cols);
+            all_depths_.push_back(depth32);
+            printProgressBar(all_depths_.size(), N);
+        }
+        std::cout << std::endl;
+        if (missing > 0) {
+            std::cerr << "[generateDepthWithVoxel] WARNING: " << missing
+                      << " depth PNG(s) missing -- those frames will produce zero tracks."
+                      << std::endl;
+        }
+        if (total_pixels > 0) {
+            const double pct = 100.0 * static_cast<double>(total_nonzero) /
+                                static_cast<double>(total_pixels);
+            std::cout << "[generateDepthWithVoxel] coverage: "
+                      << total_nonzero << " / " << total_pixels << " px ("
+                      << std::fixed << std::setprecision(3) << pct << "% non-zero)"
+                      << std::defaultfloat;
+            if (total_nonzero > 0) {
+                std::cout << "  depth range: " << depth_min_seen
+                          << " - " << depth_max_seen << " m";
+            }
+            std::cout << std::endl;
+        }
+        return;
+    }
     
     std::cout << "[generateDepthWithVoxel] Generating depths for " << N << " images ...\n";
-    for (size_t id = 0; id < N; ++id) 
+    // Ensure depth/ folder exists so the per-image cv::imwrite below actually
+    // persists. Without this the writes silently fail (cv::imwrite returns
+    // false on missing dir and we lose the visual sanity-check.)
+    std::filesystem::create_directories(dataset_path_ + "depth");
+    // Aggregate depth coverage so empty / mostly-empty maps are loud, not
+    // silent. The track filter falls over invisibly when these are sparse.
+    long long total_pixels = 0;
+    long long total_nonzero = 0;
+    double depth_min_seen = 1e30;
+    double depth_max_seen = -1e30;
+    for (size_t id = 0; id < N; ++id)
     {
         const Sophus::SE3& T_W_I_opt = poses_[id];
         const Eigen::Matrix3d Rwi_opt = T_W_I_opt.rotation_matrix();
@@ -809,6 +979,23 @@ void LvbaSystem::generateDepthWithVoxel()
             }
         }
 
+        // Aggregate stats. Fast scan -- one pass per depth map.
+        {
+            const int rows = depth.rows;
+            const int cols = depth.cols;
+            for (int r = 0; r < rows; ++r) {
+                const float* row = depth.ptr<float>(r);
+                for (int c = 0; c < cols; ++c) {
+                    const float v = row[c];
+                    if (v > 0.0f) {
+                        total_nonzero++;
+                        if ((double)v < depth_min_seen) depth_min_seen = v;
+                        if ((double)v > depth_max_seen) depth_max_seen = v;
+                    }
+                }
+            }
+            total_pixels += static_cast<long long>(rows) * static_cast<long long>(cols);
+        }
         all_depths_.push_back(depth);
         printProgressBar(all_depths_.size(), all_voxel_ids_.size());
         
@@ -823,13 +1010,36 @@ void LvbaSystem::generateDepthWithVoxel()
         }
     }
     std::cout << std::endl;
-
+    if (total_pixels > 0) {
+        const double pct = 100.0 * static_cast<double>(total_nonzero) /
+                            static_cast<double>(total_pixels);
+        std::cout << "[generateDepthWithVoxel] coverage: "
+                  << total_nonzero << " / " << total_pixels << " px ("
+                  << std::fixed << std::setprecision(3) << pct << "% non-zero)"
+                  << std::defaultfloat;
+        if (total_nonzero > 0) {
+            std::cout << "  depth range: " << depth_min_seen
+                      << " - " << depth_max_seen << " m";
+        }
+        std::cout << std::endl;
+        if (pct < 0.5) {
+            std::cout << "[generateDepthWithVoxel] WARNING: depth coverage "
+                         "is essentially zero. LiDAR is projecting outside "
+                         "image bounds (extrinsic / convention issue). "
+                         "Track filter will drop everything." << std::endl;
+        }
+    }
 }
 
 void LvbaSystem::BuildTracksAndFuse3D() {
+    std::cerr << "[BuildTracks/trace] enter; all_keypoints_.size()="
+              << all_keypoints_.size()
+              << " all_matches_.size()=" << all_matches_.size()
+              << " image_pairs_.size()=" << image_pairs_.size()
+              << " all_depths_.size()=" << all_depths_.size() << std::endl;
 
     const int N = static_cast<int>(all_keypoints_.size());
-    std::cout << "[BuildTracksAndFuse3D] Building visual points from " << N << " images ...\n";
+    std::cout << "[BuildTracksAndFuse3D] Building visual points from " << N << " images ..." << std::endl;
     // 初始化 obs_to_track
     std::vector<std::vector<int>> obs_to_track(N);
     for (int i = 0; i < N; ++i) {
@@ -863,6 +1073,16 @@ void LvbaSystem::BuildTracksAndFuse3D() {
 
     int num_tracked = 0;
     size_t total_components = 0;
+    // Per-gate drop counters so we can pinpoint which filter kills tracks.
+    // Each track passes through these gates in order; the counter increments
+    // when the gate fires the drop.
+    size_t drop_small_comp     = 0;  // component.size() < obser_thr_
+    size_t drop_no_depth       = 0;  // < obser_thr_ obs had valid depth
+    size_t drop_dist_inliers   = 0;  // < obser_thr_ within 0.12m of anchor
+    size_t drop_dedup_image    = 0;  // < obser_thr_ unique images after dedup
+    size_t drop_reproj_cnt     = 0;  // < obser_thr_ usable for reproj test
+    size_t drop_reproj_mean    = 0;  // mean_reproj > thr
+    size_t drop_view_angle     = 0;  // < obser_thr_ after view-angle pruning
     // BFS 建轨迹
     for (int i = 0; i < N; ++i) {
         for (int ki = 0; ki < (int)all_keypoints_[i].size(); ++ki) {
@@ -889,6 +1109,7 @@ void LvbaSystem::BuildTracksAndFuse3D() {
             ++total_components;
 
             if ((int)component.size() < obser_thr_) {
+                ++drop_small_comp;
                 for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
                 continue;
             }
@@ -915,6 +1136,7 @@ void LvbaSystem::BuildTracksAndFuse3D() {
             std::vector<int> idx_valid;
             for (size_t t = 0; t < points3d.size(); ++t) if (valid_mask[t]) idx_valid.push_back((int)t);
             if ((int)idx_valid.size() < obser_thr_) {
+                ++drop_no_depth;
                 for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
                 continue;
             }
@@ -922,13 +1144,22 @@ void LvbaSystem::BuildTracksAndFuse3D() {
             Eigen::Vector3d anchor = points3d[idx_valid[0]];
             
             // 按距离挑 inliers（idx_valid 是 component 的下标子集）
+            // Threshold was 0.12 m upstream -- tuned for tight close-range
+            // calibration (Retail_Street, sub-degree alignment). For
+            // typical MMS calibrations with the few-degree drift we see in
+            // practice, that's too tight even for 5-7 m feature distances:
+            // 1-2 deg calib error at 7 m -> 12-25 cm scatter, kills most
+            // tracks. 0.5 m absorbs realistic calibration noise without
+            // letting genuine outliers in (a back-projection >50 cm off
+            // anchor is almost certainly a bad match or stale depth).
             std::vector<int> inliers;
             inliers.reserve(idx_valid.size());
             for (int id : idx_valid) {
                 double dist = (points3d[id] - anchor).norm();
-                if (dist < 0.12) inliers.push_back(id);  // 0.1 m
+                if (dist < inlier_radius_m_) inliers.push_back(id);
             }
             if ((int)inliers.size() < obser_thr_) {
+                ++drop_dist_inliers;
                 for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
                 continue;
             }
@@ -941,6 +1172,7 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                 if (!best_id.count(img_id)) best_id[img_id] = id;
             }
             if ((int)best_id.size() < obser_thr_) {
+                ++drop_dedup_image;
                 for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
                 continue;
             }
@@ -991,16 +1223,14 @@ void LvbaSystem::BuildTracksAndFuse3D() {
             }
 
             if (cnt_err < obser_thr_) {
+                ++drop_reproj_cnt;
                 for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
                 continue;
             }
 
             const double mean_reproj = sum_err / double(cnt_err);
             if (mean_reproj > reproj_mean_thr_px_) {
-
-                std::cout << "[TrackFilter] drop by mean reproj=" << mean_reproj
-                          << " thr=" << reproj_mean_thr_px_ << " cnt=" << cnt_err << std::endl;
-
+                ++drop_reproj_mean;
                 for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
                 continue;
             }
@@ -1053,7 +1283,7 @@ void LvbaSystem::BuildTracksAndFuse3D() {
             // };
 
             if (kept_obs_ids.empty() || (int)kept_obs_ids.size() < obser_thr_) {
-                // log_track_stats("drop");
+                ++drop_view_angle;
                 for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
                 continue;
             }
@@ -1104,6 +1334,26 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                   << " total=" << total_components
                   << " ratio=" << std::fixed << std::setprecision(2)
                   << keep_ratio << "%" << std::defaultfloat << std::endl;
+        // Per-gate breakdown so the chokepoint is visible. The gate that
+        // dominates points at the underlying problem:
+        //   small_comp  -> match.db pairs not chaining across views
+        //   no_depth    -> depth maps mostly empty (extrinsic / convention
+        //                  bug projecting LiDAR to wrong pixels)
+        //   dist_inliers-> back-projected 3D points scatter (intrinsic /
+        //                  extrinsic / depth-map noise)
+        //   dedup_image -> tracks observed by < obser_thr_ unique cameras
+        //   reproj_cnt  -> pose chain fails (Rcw / tcw invalid)
+        //   reproj_mean -> tracks pass geometry but fail reproj threshold
+        //   view_angle  -> view-angle pruning leaves too few cameras
+        std::cout << "[TrackFilter/breakdown]"
+                  << " small_comp=" << drop_small_comp
+                  << " no_depth="   << drop_no_depth
+                  << " dist_inl="   << drop_dist_inliers
+                  << " dedup_img="  << drop_dedup_image
+                  << " rep_cnt="    << drop_reproj_cnt
+                  << " rep_mean="   << drop_reproj_mean
+                  << " view_ang="   << drop_view_angle
+                  << std::endl;
     }
     tracks_before_ = tracks_;
 
@@ -1146,7 +1396,18 @@ void LvbaSystem::buildGridMapFromOptimized() {
     }
 
 
-    const double half_w = 0.5;
+    // Half-width (seconds) of the lidar-frame merge window used per image.
+    // Pulled from YAML (`depth_merge/half_window_s`) so it can be tuned
+    // without a code change. Upstream default 0.5 s assumes scenes where
+    // LiDAR vertical FOV covers most of the camera FOV; wider-camera-than-
+    // LiDAR rigs (4K + Livox Horizon ~25 deg V-FOV) need a longer window
+    // so motion sweeps the unsampled bands. Empirical: 0.5 -> ~5% coverage,
+    // 2.0 -> 7.4%, 10.0 -> ~15-20% on a forward-facing MMS at ~10 m/s.
+    // Beyond ~10 s the marginal coverage gain shrinks (voxel cells re-hit
+    // rather than filled) and occlusion artifacts grow (points captured
+    // from past poses no longer visible from current). For LiDAR-FOV-
+    // wider-than-camera rigs, leave at 0.5.
+    const double half_w = depth_merge_half_w_s_;
     std::vector<double> pcd_ts;
     pcd_ts.reserve(x_buf_full.size());
     for (const auto& kv : x_buf_full) pcd_ts.push_back(kv.t);
@@ -1298,10 +1559,15 @@ void LvbaSystem::optimizeCameraPoses()
 
     const double surf_voxel_size = dataset_io_->stage2_root_voxel_size_;
     const float surf_eigen_thr = dataset_io_->stage2_eigen_ratio_array_[0];
+    std::cerr << "[OptBA/trace] surf_voxel_size=" << surf_voxel_size
+              << " surf_eigen_thr=" << surf_eigen_thr << std::endl;
 
     const auto& pl_fulls = dataset_io_->pl_fulls_;
     const auto& x_buf_full = dataset_io_->x_buf_;
     const int total_size = static_cast<int>(std::min(pl_fulls.size(), x_buf_full.size()));
+    std::cerr << "[OptBA/trace] pl_fulls.size()=" << pl_fulls.size()
+              << " x_buf_full.size()=" << x_buf_full.size()
+              << " total_size=" << total_size << std::endl;
     if (total_size == 0) {
         std::cerr << "[optimizeCamPoses] empty pl_fulls/x_buf, skip." << std::endl;
         return;
@@ -1339,6 +1605,9 @@ void LvbaSystem::optimizeCameraPoses()
     }
 
     const int anchor_size = static_cast<int>(std::min(anchor_poses.size(), anchor_clouds.size()));
+    std::cerr << "[OptBA/trace] anchor_size=" << anchor_size
+              << " window_size=" << window_size
+              << " anchor_leaf=" << anchor_leaf << std::endl;
     if (anchor_size == 0) {
         std::cerr << "[optimizeCamPoses] empty anchor_poses/anchor_clouds, skip." << std::endl;
         return;
@@ -1346,13 +1615,48 @@ void LvbaSystem::optimizeCameraPoses()
 
     std::unordered_map<VOXEL_LOC, OCTO_TREE_ROOT*> surf_map;
     for (int j = 0; j < anchor_size; ++j) {
+        const size_t n_pts = anchor_clouds[j] ? anchor_clouds[j]->size() : 0;
+        // Finer cadence near the end where the previous trace lost the
+        // crash. Every iter past 599; otherwise every 100.
+        if (j == 0 || j == anchor_size - 1 || j >= 595 || j % 100 == 0) {
+            std::cerr << "[OptBA/trace] cut_voxel iter " << j << "/" << anchor_size
+                      << "  anchor_cloud pts=" << n_pts
+                      << "  surf_map.size before=" << surf_map.size() << std::endl;
+        }
+        if (!anchor_clouds[j] || n_pts == 0) {
+            std::cerr << "[OptBA/trace] SKIPPING empty anchor_cloud at j=" << j << std::endl;
+            continue;
+        }
+        // Bracket the call so we see if a SPECIFIC iter dies inside cut_voxel
+        // (vs the loop bookkeeping). The trace above prints BEFORE cut_voxel
+        // runs; this prints AFTER. The first iter we see "before" without a
+        // matching "after" is the crashing one.
+        if (j >= 605) std::cerr << "[OptBA/trace]   pre  cut_voxel j=" << j << std::endl;
         cut_voxel(surf_map, *anchor_clouds[j], anchor_poses[j], j, anchor_size,
                   surf_voxel_size, surf_eigen_thr);
+        if (j >= 605) std::cerr << "[OptBA/trace]   post cut_voxel j=" << j
+                                 << " surf_map.size=" << surf_map.size() << std::endl;
     }
+    std::cerr << "[OptBA/trace] post cut_voxel surf_map.size()=" << surf_map.size()
+              << "  anchor_poses.size()=" << anchor_poses.size() << std::endl;
     printf("surf_map.size(): %zu\n", surf_map.size());
+    // Recut sweep -- this is the heavy step. Trace per N entries so we
+    // can localize a crash inside recut().
+    std::cerr << "[OptBA/trace] starting recut loop on "
+              << surf_map.size() << " entries..." << std::endl;
+    size_t recut_idx = 0;
+    size_t recut_nulls = 0;
     for (auto& kv : surf_map) {
-        if (kv.second != nullptr) kv.second->recut(anchor_poses);
+        if (kv.second == nullptr) { ++recut_nulls; ++recut_idx; continue; }
+        if (recut_idx == 0 || recut_idx % 100000 == 0) {
+            std::cerr << "[OptBA/trace] recut iter " << recut_idx << "/" << surf_map.size()
+                      << "  nulls so far=" << recut_nulls << std::endl;
+        }
+        kv.second->recut(anchor_poses);
+        ++recut_idx;
     }
+    std::cerr << "[OptBA/trace] post recut surf_map.size()=" << surf_map.size()
+              << "  nulls=" << recut_nulls << std::endl;
     printf("After recut, surf_map.size(): %zu\n", surf_map.size());
 
     // ---------------- 初始化优化变量 ----------------
@@ -2034,7 +2338,16 @@ void LvbaSystem::VisualizeOptComparison(
 }
 
 std::string LvbaSystem::getImagePath(double image_id) {
-  return dataset_path_ + "all_image/" + std::to_string(image_id) + ".png";
+  // Try common image extensions in priority order. Upstream hardcoded ".png"
+  // (matched the Retail_Street sample). For datasets exported from GLIM the
+  // source extension may be .jpg / .jpeg, so we fall back through them.
+  // Fall-through to ".png" preserves the old loud failure path for missing
+  // files when none of the candidates exist.
+  const std::string base = dataset_path_ + "all_image/" + std::to_string(image_id);
+  for (const char* ext : {".png", ".jpg", ".jpeg", ".bmp"}) {
+    if (std::filesystem::exists(base + ext)) return base + ext;
+  }
+  return base + ".png";
 }
 
 std::string LvbaSystem::getPcdPath(double pcd_id) {
